@@ -1,0 +1,264 @@
+heat_template_version: 2013-05-23
+description: AutoScaling neutron floating IP 
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+    defalut: 8d9d220b-9d3e-4ee5-8b2c-543b47914144
+  key:
+    type: string
+    description: SSH key to connect to the servers
+    default: hong_key
+  flavor:
+    type: string
+    description: flavor used by the web servers
+    default: m1.medium
+  database_flavor:
+    type: string
+    description: flavor used by the db server
+    default: m1.medium
+# subnet_id:   #hong
+ #   type: string
+ #   description: subnet on which the load balancer will be located
+  database_name:
+    type: string
+    description: Name of the wordpress DB
+    default: wordpress
+  database_user:
+    type: string
+    description: Name of the wordpress user
+    default: wordpress
+ # network_id:  # hong
+ #   type: string
+ #   description: ID of network to which a db server attaches
+      
+  # parameters for network
+  public_net_id:
+    type: string
+    description: ID of public network for which floating IP addresses will be allocated
+    default: 
+  private_net_name:
+    type: string
+    description: Name of private network to be created
+  private_net_cidr:
+    type: string
+    description: Private network address (CIDR notation)
+  private_net_gateway:
+    type: string
+    description: Private network gateway address
+  private_net_pool_start:
+    type: string
+    description: Start of private network IP address allocation pool
+  private_net_pool_end:
+    type: string
+    description: End of private network IP address allocation pool
+    
+#  web_port:
+#    type: string
+#    description: Network port to which web servers attache  
+      
+resources:
+  
+  # resources for network
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: { get_param: private_net_name }
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: { get_param: private_net_cidr }
+      gateway_ip: { get_param: private_net_gateway }
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param: private_net_pool_end }
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_net_id }
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+  db_server_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+  web_server_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      
+  # resources for autoscaling    
+  database_password:
+    type: OS::Heat::RandomString
+  database_root_password:
+    type: OS::Heat::RandomString
+  db:
+    type: OS::Nova::Server
+    properties:
+      name: db_server  # hong
+      flavor: {get_param: database_flavor}
+      image: {get_param: image}
+      key_name: {get_param: key}
+      networks:  # hong
+   #     - network: {get_param: network_id}
+        - port: {get_resource: db_server_port}    
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            yum -y install mariadb mariadb-server
+            systemctl enable mariadb.service
+            systemctl start mariadb.service
+            mysqladmin -u root password $db_rootpassword
+            cat << EOF | mysql -u root --password=$db_rootpassword
+            CREATE DATABASE $db_name;
+            GRANT ALL PRIVILEGES ON $db_name.* TO "$db_user"@"%"
+            IDENTIFIED BY "$db_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $db_rootpassword: {get_attr: [database_root_password, value]}
+            $db_name: {get_param: database_name}
+            $db_user: {get_param: database_user}
+            $db_password: {get_attr: [database_password, value]}
+  web_server_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      max_size: 3
+      resource:
+        type: https://raw.githubusercontent.com/kanjuk95/hot/master/lb_server.yaml
+      #  type: lb_server.yaml
+      #  type: My::Server::LBServer
+      #  type: file:///Users/Hong/heat-templates/hot/lb_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          key_name: {get_param: key}
+          network_id: {get_resource: private_net}    #hong
+          #web_port: {get_resource: web_server_port}  #hong
+          #networks:
+          #  - port: {get_resource: web_server_port}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.stack": {get_param: "OS::stack_id"}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                yum -y install httpd wordpress
+                systemctl enable httpd.service
+                systemctl start httpd.service
+                setsebool -P httpd_can_network_connect_db=1
+
+                sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+                sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+                sed -i s/database_name_here/$db_name/ /etc/wordpress/wp-config.php
+                sed -i s/username_here/$db_user/ /etc/wordpress/wp-config.php
+                sed -i s/password_here/$db_password/ /etc/wordpress/wp-config.php
+                sed -i s/localhost/$db_host/ /etc/wordpress/wp-config.php
+
+                systemctl restart httpd.service
+              params:
+                $db_name: {get_param: database_name}
+                $db_user: {get_param: database_user}
+                $db_password: {get_attr: [database_password, value]}
+                $db_host: {get_attr: [db, first_address]}
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: 1
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: -1
+  cpu_alarm_high:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-up if the average CPU > 50% for 1 minute
+      meter_name: cpu_util
+      statistic: avg
+      period: 60
+      evaluation_periods: 1
+      threshold: 50
+      alarm_actions:
+        - {get_attr: [web_server_scaleup_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: gt
+  cpu_alarm_low:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-down if the average CPU < 15% for 10 minutes
+      meter_name: cpu_util
+      statistic: avg
+      period: 600
+      evaluation_periods: 1
+      threshold: 15
+      alarm_actions:
+        - {get_attr: [web_server_scaledown_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: lt
+  
+
+# load balancer
+
+  lb_vip_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: {get_resource: private_net }
+      fixed_ips:
+        - subnet_id: {get_resource: private_subnet }
+  lb_vip_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties: 
+      floating_network_id: {get_param: public_net_id}
+      port_id: {get_resource: lb_vip_port}
+ 
+  lb_pool_vip:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: {get_resource: lb_vip_floating_ip}
+     # fixed_ip_address: "10.10.10.8"
+     # fixed_ip_address: {get_attr: [pool, vip]}
+      port_id: {'Fn::Select': ['port_id', {get_attr: [pool, vip]}]}
+  
+  monitor:
+    type: OS::Neutron::HealthMonitor
+    properties:
+      type: TCP
+      delay: 3
+      max_retries: 5
+      timeout: 5
+  pool:
+    type: OS::Neutron::Pool
+    properties:
+      protocol: HTTP
+      monitors: [{get_resource: monitor}]
+     #subnet_id: {get_param: subnet_id}
+      subnet_id: {get_resource: private_subnet}  #hong      
+      lb_method: ROUND_ROBIN
+      vip:
+        protocol_port: 80
+        #address: {get_attr: [lb_vip_port, fixed_ips]}  #hong
+        #address: "10.10.30.8"  #hong
+  lb:
+    type: OS::Neutron::LoadBalancer
+    properties:
+      protocol_port: 80
+      pool_id: {get_resource: pool}
