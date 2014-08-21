@@ -13,9 +13,9 @@ parameters:
   pool_id:
     type: string
     description: Pool to contact
-  user_data:
-    type: string
-    description: Server user_data
+#  user_data:
+#    type: string
+#    description: Server user_data
   metadata:
     type: json
   network_id:   #hong
