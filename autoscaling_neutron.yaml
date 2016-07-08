@@ -1,3 +1,6 @@
+Test for pull command
+
+
 heat_template_version: 2013-05-23
 description: AutoScaling neutron floating IP 
 parameters:
