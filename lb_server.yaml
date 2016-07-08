@@ -1,3 +1,5 @@
+Test for remote pulling
+
 heat_template_version: 2013-05-23
 description: A load-balancer server
 parameters:
